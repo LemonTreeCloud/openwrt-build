@@ -168,6 +168,18 @@ jobs:
           echo "Total archives ($TOTAL) <= $KEEP, nothing to delete."
         fi
 
+        # Generate presigned URL (valid for 7 days = 604800 seconds)
+        echo "Generating presigned download URL..."
+        PRESIGNED_URL=$(aws s3 presign \
+          "s3://$R2_BUCKET/$R2_PATH/$ARCHIVE_NAME" \
+          --expires-in 604800 \
+          --endpoint-url "$R2_ENDPOINT")
+        # Mask the URL to prevent it from appearing in logs
+        echo "::add-mask::${PRESIGNED_URL}"
+        echo "PRESIGNED_URL=${PRESIGNED_URL}" >> $GITHUB_ENV
+        echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+        echo "Presigned URL generated (valid for 7 days)."
+
     - name: Telegram notification
       if: always()
       env:
@@ -175,12 +187,38 @@ jobs:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         if [ "${{ steps.compile.outputs.status }}" == "success" ]; then
-          STATUS="✅ 编译成功"
+          STATUS="✅ <b>编译成功</b>"
+          DOWNLOAD_SECTION="
+        ━━━━━━━━━━━━━━━━━━
+        📥 <b>固件下载</b>
+        ├ 文件: <code>${ARCHIVE_NAME}</code>
+        └ <a href='${PRESIGNED_URL}'>⬇️ 点击下载</a> (7天有效)"
         else
-          STATUS="❌ 编译失败"
+          STATUS="❌ <b>编译失败</b>"
+          DOWNLOAD_SECTION=""
         fi
-        MESSAGE="${STATUS}%0A%0A📦 项目: ${{ github.repository }}%0A🔀 分支: ${REPO_BRANCH}%0A🔧 工作流: ${{ github.workflow }}%0A🕐 时间: $(date +'%Y-%m-%d %H:%M:%S')%0A🔗 详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d chat_id="${TELEGRAM_CHAT_ID}" \
-          -d text="${MESSAGE}" \
-          -d parse_mode="HTML"
+
+        MESSAGE="${STATUS}
+        ━━━━━━━━━━━━━━━━━━
+        📋 <b>构建信息</b>
+        ├ 项目: <code>${{ github.repository }}</code>
+        ├ 分支: <code>${REPO_BRANCH}</code>
+        ├ 工作流: <code>${{ github.workflow }}</code>
+        └ 时间: <code>$(date +'%Y-%m-%d %H:%M:%S')</code>
+        ${DOWNLOAD_SECTION}
+        ━━━━━━━━━━━━━━━━━━
+        🔗 <a href='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'>查看构建详情</a>"
+
+        # Remove leading whitespace from heredoc-style indentation
+        MESSAGE=$(echo "$MESSAGE" | sed 's/^        //g')
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+          --data-urlencode "text=${MESSAGE}" \
+          --data-urlencode "parse_mode=HTML" \
+          --data-urlencode "disable_web_page_preview=true")
+        echo "Telegram API response code: ${HTTP_CODE}"
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::warning::Telegram notification failed with HTTP ${HTTP_CODE}"
+        fi

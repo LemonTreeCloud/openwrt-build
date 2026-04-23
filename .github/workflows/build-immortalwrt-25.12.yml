@@ -16,8 +16,8 @@ env:
   CONFIG_FILE: immortalwrt-25.12/.config
   DIY_P1_SH: immortalwrt-25.12/diy-part1.sh
   DIY_P2_SH: immortalwrt-25.12/diy-part2.sh
-  UPLOAD_BIN_DIR: true
-  UPLOAD_FIRMWARE: true
+  R2_BUCKET: openwrt-firmware
+  R2_PATH: firmware/immortalwrt-25.12
   TZ: Asia/Shanghai
 
 jobs:
@@ -114,16 +114,9 @@ jobs:
       if: (!cancelled())
       run: df -hT
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
-
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: (!cancelled())
       run: |
         cd openwrt/bin/targets/*/*
         rm -rf packages
@@ -138,9 +131,56 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
+    - name: Upload firmware to R2
       if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: auto
+        R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      run: |
+        ARCHIVE_NAME="firmware_$(date +%Y%m%d%H%M%S).tar.gz"
+        tar -czf "/tmp/$ARCHIVE_NAME" -C "$FIRMWARE" .
+        echo "Uploading $ARCHIVE_NAME to R2..."
+        aws s3 cp "/tmp/$ARCHIVE_NAME" "s3://$R2_BUCKET/$R2_PATH/$ARCHIVE_NAME" \
+          --endpoint-url "$R2_ENDPOINT"
+        echo "Upload complete. Cleaning old archives..."
+        ALL_KEYS=$(aws s3api list-objects-v2 \
+          --bucket "$R2_BUCKET" \
+          --prefix "$R2_PATH/" \
+          --query 'Contents | sort_by(@, &LastModified) | [].Key' \
+          --output text \
+          --endpoint-url "$R2_ENDPOINT")
+        TOTAL=$(echo "$ALL_KEYS" | wc -w)
+        KEEP=3
+        if [ "$TOTAL" -gt "$KEEP" ]; then
+          DELETE_COUNT=$((TOTAL - KEEP))
+          DELETE_KEYS=$(echo "$ALL_KEYS" | tr '\t' '\n' | head -n "$DELETE_COUNT")
+          for key in $DELETE_KEYS; do
+            echo "Deleting old archive: $key"
+            aws s3api delete-object \
+              --bucket "$R2_BUCKET" \
+              --key "$key" \
+              --endpoint-url "$R2_ENDPOINT"
+          done
+          echo "Deleted $DELETE_COUNT old archive(s)."
+        else
+          echo "Total archives ($TOTAL) <= $KEEP, nothing to delete."
+        fi
+
+    - name: Telegram notification
+      if: always()
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        if [ "${{ steps.compile.outputs.status }}" == "success" ]; then
+          STATUS="✅ 编译成功"
+        else
+          STATUS="❌ 编译失败"
+        fi
+        MESSAGE="${STATUS}%0A%0A📦 项目: ${{ github.repository }}%0A🔀 分支: ${REPO_BRANCH}%0A🔧 工作流: ${{ github.workflow }}%0A🕐 时间: $(date +'%Y-%m-%d %H:%M:%S')%0A🔗 详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d chat_id="${TELEGRAM_CHAT_ID}" \
+          -d text="${MESSAGE}" \
+          -d parse_mode="HTML"
